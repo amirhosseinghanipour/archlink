@@ -37,6 +37,7 @@ yay -S archlink
 - `pacman` package manager installed.
 - Rust and Cargo for building from source.
 - Internet connection for AUR searches (real real).
+- An AUR helper like yay or paru for installing AUR packages (**recommended**).
 
 ## Usage
 ### Search for Packages 
@@ -143,3 +144,4 @@ The `PKGBUILD` file is included in the repository for AUR submission.
 - `strsim` (fuzzy matching)
 - `toml` (configuration parsing)
 - `urlencoding` (URL encoding for AUR queries)
+- `colored` (ANSI colors)
