@@ -1,6 +1,6 @@
 [package]
 name = "archlink"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "ArchLink helps Arch Linux users to find the right packages to install"
 license = "MIT"
