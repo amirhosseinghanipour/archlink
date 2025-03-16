@@ -9,6 +9,7 @@ use std::time::Duration;
 use strsim::levenshtein;
 use tokio;
 use colored::Colorize;
+use serde_json;
 
 const VERSION: &str = "0.1.0";
 
@@ -36,38 +37,47 @@ struct Package {
     source: &'static str,
 }
 
-#[derive(Serialize, Deserialize, Default)]
+#[derive(Serialize, Deserialize, Debug)]
 struct Config {
-    max_results: usize,
+    max_results: Option<usize>, 
 }
 
 impl Config {
-    fn load() -> Result<Self, String> {
+    fn load() -> Self {
         let config_path = Path::new("/etc/archlink/config.toml");
         if config_path.exists() {
-            let contents = fs::read_to_string(config_path)
-                .map_err(|e| format!("Failed to read config file: {}", e))?;
-            toml::from_str(&contents)
-                .map_err(|e| format!("Invalid config file format: {}", e))
-        } else {
-            Ok(Config { max_results: 10 })
+            match fs::read_to_string(config_path) {
+                Ok(contents) => match toml::from_str(&contents) {
+                    Ok(config) => return config,
+                    Err(e) => {
+                        eprintln!(
+                            "{}",
+                            format!("Warning: Invalid config file format: {}", e).yellow()
+                        );
+                    }
+                },
+                Err(e) => {
+                    eprintln!(
+                        "{}",
+                        format!("Warning: Failed to read config file: {}", e).yellow()
+                    );
+                }
+            }
+        }
+        Config {
+            max_results: Some(10), 
         }
     }
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let config = match Config::load() {
-        Ok(cfg) => cfg,
-        Err(e) => {
-            eprintln!("{}", format!("Warning: {}", e).yellow());
-            Config::default()
-        }
-    };
+    let config = Config::load();
+    let max_results = config.max_results.unwrap_or(10);
 
     let matches = Command::new("archlink")
         .version(VERSION)
-        .about("ArchLink helps Arch Linux users to find the right packages to install")
+        .about("ArchLink helps Arch Linux users to find and install packages")
         .subcommand_required(true)
         .arg_required_else_help(true)
         .subcommand(
@@ -97,7 +107,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 eprintln!("{}", "Error: Query cannot be empty.".red());
                 std::process::exit(1);
             }
-            search_packages(query, &config).await?;
+            search_packages(query, max_results).await?;
         }
         Some(("install", sub_m)) => {
             let package = sub_m.get_one::<String>("package").unwrap().trim();
@@ -113,21 +123,47 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-async fn search_packages(query: &str, config: &Config) -> Result<(), Box<dyn std::error::Error>> {
-    let official_results = search_official_repos(query)?;
-    let aur_results = search_aur(query).await?;
-    let all_results = rank_results(official_results, aur_results, query, config.max_results);
+async fn search_packages(query: &str, max_results: usize) -> Result<(), Box<dyn std::error::Error>> {
+    let mut official_results = Vec::new();
+
+    match search_arch_website(query).await {
+        Ok(results) => official_results.extend(results),
+        Err(e) => eprintln!("{}", format!("Warning: Web search failed: {}", e).yellow()),
+    }
+
+    if official_results.is_empty() {
+        match search_official_repos(query) {
+            Ok(results) => official_results.extend(results),
+            Err(e) => eprintln!("{}", format!("Warning: pacman search failed: {}", e).yellow()),
+        }
+    }
+
+    let aur_results = match search_aur(query).await {
+        Ok(results) => results,
+        Err(e) => {
+            eprintln!("{}", format!("Warning: AUR search failed: {}", e).yellow());
+            Vec::new()
+        }
+    };
+
+    let all_results = rank_results(official_results, aur_results, query, max_results);
 
     if all_results.is_empty() {
-        println!("{}", format!("No packages found for '{}'. Try refining your query.", query).yellow());
+        println!(
+            "{}",
+            format!("No packages found for '{}'. Try refining your query.", query).yellow()
+        );
         return Ok(());
     }
 
-    println!("{}", format!("Suggestions for '{}':", query).bold());
+    println!(
+        "{}",
+        format!("Suggestions for '{}':", query).bold().white()
+    );
     for (i, pkg) in all_results.iter().enumerate() {
         println!(
             "{}. {:<30} {:<15} - {} [{}]",
-            (i + 1).to_string().bold(),
+            (i + 1).to_string().bold().white(),
             pkg.name.green(),
             pkg.version.blue(),
             pkg.description,
@@ -135,7 +171,10 @@ async fn search_packages(query: &str, config: &Config) -> Result<(), Box<dyn std
         );
     }
 
-    print!("{}", "Enter the number of the package to install (0 to exit): ".bold());
+    print!(
+        "{}",
+        "Enter the number of the package to install (0 to exit): ".bold().white()
+    );
     io::stdout().flush()?;
     let mut input = String::new();
     io::stdin()
@@ -146,7 +185,12 @@ async fn search_packages(query: &str, config: &Config) -> Result<(), Box<dyn std
 
     if choice > 0 && choice <= all_results.len() {
         let selected_package = &all_results[choice - 1];
-        print!("{}", format!("Install '{}' (y/N)? ", selected_package.name).bold());
+        print!(
+            "{}",
+            format!("Install '{}' (y/N)? ", selected_package.name)
+                .bold()
+                .white()
+        );
         io::stdout().flush()?;
         let mut confirm = String::new();
         io::stdin()
@@ -165,93 +209,99 @@ async fn search_packages(query: &str, config: &Config) -> Result<(), Box<dyn std
     Ok(())
 }
 
-fn search_official_repos(query: &str) -> Result<Vec<Package>, String> {
-    let query_words: Vec<&str> = query.split_whitespace().collect();
-    let mut results = Vec::new();
+async fn search_arch_website(query: &str) -> Result<Vec<Package>, String> {
+    let client = Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .map_err(|e| format!("Failed to build HTTP client: {}", e))?;
+    let url = format!(
+        "https://archlinux.org/packages/search/json/?q={}",
+        urlencoding::encode(query)
+    );
+    let response = client
+        .get(&url)
+        .send()
+        .await
+        .map_err(|e| format!("Failed to fetch Arch website data: {}", e))?;
+    let json: serde_json::Value = response
+        .json()
+        .await
+        .map_err(|e| format!("Failed to parse JSON: {}", e))?;
 
-    for word in query_words {
-        let output = SysCommand::new("pacman")
-            .args(["-Ss", word])
-            .output()
-            .map_err(|e| {
-                format!(
-                    "Failed to run 'pacman -Ss {}': {}. Is pacman installed?",
-                    word, e
-                )
-            })?;
-
-        let output_str = String::from_utf8_lossy(&output.stdout);
-        if !output.status.success() && output_str.trim().is_empty() {
-            continue;
-        } else if !output.status.success() {
-            return Err(format!(
-                "pacman -Ss '{}' failed with exit code: {}. Output: '{}'",
-                word, output.status, output_str
-            ));
-        }
-
-        let mut current_name = None;
-        let mut description = String::new();
-
-        for line in output_str.lines() {
-            if line.starts_with(" ") {
-                if current_name.is_some() {
-                    description.push_str(line.trim());
-                    description.push(' ');
-                }
-            } else if !line.is_empty() {
-                if let Some(name) = current_name.take() {
-                    results.push(Package {
-                        name,
-                        version: String::new(), 
-                        description: if description.is_empty() {
-                            "No description available".to_string()
-                        } else {
-                            description.trim().to_string()
-                        },
-                        source: "official",
-                    });
-                }
-                let parts: Vec<&str> = line.split_whitespace().collect();
-                if parts.len() < 2 {
-                    continue;
-                }
-                current_name = Some(parts[0].to_string());
-                let version = parts[1].to_string(); 
-                description = parts.get(2..).map(|p| p.join(" ")).unwrap_or_default();
-                if let Some(name) = current_name.take() {
-                    results.push(Package {
-                        name,
-                        version,
-                        description: if description.is_empty() {
-                            "No description available".to_string()
-                        } else {
-                            description.trim().to_string()
-                        },
-                        source: "official",
-                    });
-                }
-            }
-        }
-        
-        if let Some(name) = current_name {
-            results.push(Package {
+    let mut packages = Vec::new();
+    if let Some(results) = json.get("results").and_then(|r| r.as_array()) {
+        for pkg in results {
+            let name = pkg["pkgname"]
+                .as_str()
+                .unwrap_or("unknown")
+                .to_string();
+            let version = format!(
+                "{}-{}",
+                pkg["pkgver"].as_str().unwrap_or(""),
+                pkg["pkgrel"].as_str().unwrap_or("")
+            );
+            let description = pkg["pkgdesc"]
+                .as_str()
+                .unwrap_or("No description available")
+                .to_string();
+            packages.push(Package {
                 name,
-                version: String::new(), 
-                description: if description.is_empty() {
-                    "No description available".to_string()
-                } else {
-                    description.trim().to_string()
-                },
+                version,
+                description,
                 source: "official",
             });
         }
     }
+    Ok(packages)
+}
 
-    use std::collections::HashSet;
-    let mut seen = HashSet::new();
-    results.retain(|pkg| seen.insert(pkg.name.clone()));
-    Ok(results)
+fn search_official_repos(query: &str) -> Result<Vec<Package>, String> {
+    let output = SysCommand::new("pacman")
+        .args(["-Ss", query])
+        .output()
+        .map_err(|e| format!("Failed to run pacman: {}", e))?;
+    let output_str = String::from_utf8_lossy(&output.stdout);
+    if !output.status.success() {
+        return Err(format!("pacman failed with: {}", output_str));
+    }
+
+    let mut packages = Vec::new();
+    let mut current_pkg: Option<Package> = None;
+
+    for line in output_str.lines() {
+        if line.starts_with(" ") {
+            if let Some(ref mut pkg) = current_pkg {
+                pkg.description.push_str(line.trim());
+                pkg.description.push(' ');
+            }
+        } else if !line.is_empty() {
+            if let Some(pkg) = current_pkg.take() {
+                packages.push(pkg);
+            }
+            let parts: Vec<&str> = line.splitn(2, ' ').collect();
+            if parts.len() < 2 {
+                continue;
+            }
+            let name_ver: Vec<&str> = parts[0].split('/').collect();
+            let name = name_ver.last().unwrap_or(&"unknown").to_string();
+            let version_desc: Vec<&str> = parts[1].splitn(2, ' ').collect();
+            let version = version_desc[0].to_string();
+            let description = version_desc
+                .get(1)
+                .unwrap_or(&"No description available")
+                .to_string();
+            current_pkg = Some(Package {
+                name,
+                version,
+                description,
+                source: "official",
+            });
+        }
+    }
+    if let Some(pkg) = current_pkg {
+        packages.push(pkg);
+    }
+    Ok(packages)
 }
 
 async fn search_aur(query: &str) -> Result<Vec<Package>, Box<dyn std::error::Error>> {
@@ -303,7 +353,7 @@ fn rank_results(
     combined.sort_by(|a, b| {
         let score_a = score_package(a, query, &query_words);
         let score_b = score_package(b, query, &query_words);
-        score_b.cmp(&score_a) 
+        score_b.cmp(&score_a)
     });
 
     combined.truncate(max_results);
@@ -324,51 +374,62 @@ fn score_package(pkg: &Package, query: &str, query_words: &[&str]) -> u32 {
 }
 
 fn install_package(package: &str, source: &str) -> Result<(), String> {
+    let mut attempted = Vec::new();
+
     if source == "official" || source == "unknown" {
-        println!("{}", format!("Running 'sudo pacman -S {}'... (may prompt for password)", package).bold());
+        attempted.push("pacman");
+        println!(
+            "{}",
+            format!("Trying 'sudo pacman -S {}'... (may prompt for password)", package)
+                .bold()
+                .white()
+        );
         let status = SysCommand::new("sudo")
-            .args(["pacman", "-S", package])
+            .args(["pacman", "-S", package, "--noconfirm"])
             .status()
-            .map_err(|e| format!("Failed to execute sudo pacman: {}", e))?;
-
+            .map_err(|e| format!("Failed to run pacman: {}", e))?;
         if status.success() {
-            println!("{}", format!("Successfully installed '{}'", package).green());
-            Ok(())
-        } else {
-            Err(format!(
-                "Failed to install '{}'. Exit code: {}. Ensure sudo privileges and package availability.",
-                package,
-                status.code().unwrap_or(-1)
-            ))
+            println!(
+                "{}",
+                format!("Successfully installed '{}' with pacman", package).green()
+            );
+            return Ok(());
         }
-    } else if source == "aur" {
-        let helpers = [("yay", "yay -S"), ("paru", "paru -S")];
-        for (helper, cmd) in helpers {
-            if SysCommand::new("which").arg(helper).output().is_ok() {
-                println!("{}", format!("Running '{} {}'... (may prompt for password)", cmd, package).bold());
-                let status = SysCommand::new(helper)
-                    .args(["-S", package])
-                    .status()
-                    .map_err(|e| format!("Failed to execute {}: {}", helper, e))?;
+    }
 
-                if status.success() {
-                    println!("{}", format!("Successfully installed '{}'", package).green());
-                    return Ok(());
-                } else {
-                    return Err(format!(
-                        "Failed to install '{}' with {}. Exit code: {}. Check AUR helper logs.",
-                        package,
-                        helper,
-                        status.code().unwrap_or(-1)
-                    ));
-                }
+    let helpers = [("yay", vec!["-S"]), ("paru", vec!["-S"])];
+    for (helper, args) in helpers {
+        if SysCommand::new("which").arg(helper).output().is_ok() {
+            attempted.push(helper);
+            println!(
+                "{}",
+                format!("Trying '{} -S {}'... (may prompt for password)", helper, package)
+                    .bold()
+                    .white()
+            );
+            let mut cmd_args = args;
+            cmd_args.push(package);
+            let status = SysCommand::new(helper)
+                .args(&cmd_args)
+                .status()
+                .map_err(|e| format!("Failed to run {}: {}", helper, e))?;
+            if status.success() {
+                println!(
+                    "{}",
+                    format!("Successfully installed '{}' with {}", package, helper).green()
+                );
+                return Ok(());
             }
         }
-        Err(format!(
-            "Cannot install AUR package '{}'. Install an AUR helper like 'yay' or 'paru' (e.g., 'sudo pacman -S yay') and try again, or build manually from https://aur.archlinux.org/packages/{}",
-            package, package
-        ))
-    } else {
-        Err(format!("Unknown package source '{}'. Cannot install '{}'.", source, package))
     }
+
+    Err(format!(
+        "{}",
+        format!(
+            "Failed to install '{}'. Attempted: {}. Install yay/paru or check package name.",
+            package,
+            attempted.join(", ")
+        )
+        .red()
+    ))
 }
