@@ -5,6 +5,11 @@ edition = "2024"
 description = "ArchLink helps Arch Linux users to find the right packages to install"
 license = "MIT"
 repository = "https://github.com/amirhosseinghanipour/archlink"
+homepage = "https://github.com/amirhosseinghanipour/archlink"
+authors = ["Amirhossein Ghanipour <d3v1ll3n@gmail.com>"]
+keywords = ["archlinux", "aur", "pacman", "package-manager"]
+categories = ["command-line-utilities"]
+readme = "README.md"
 
 [dependencies]
 clap = { version = "4.5", features = ["derive"] }
