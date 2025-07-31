@@ -8,29 +8,33 @@
 - Configurable maximum number of search results via a TOML file.
 
 ## Installation
+
+### From Crates.io (Recommended)
+If you have the Rust toolchain installed, you can install `archlink` directly from the official package registry:
+```sh
+cargo install archlink
+```
+
 ### From Source
 1. Clone the repository:
-```git clone https://github.com/amirhosseinghanipour/archlink.git 
+```sh
+git clone https://github.com/amirhosseinghanipour/archlink.git 
 cd archLink
 ```
 2. Build the project:
-```
+```sh
 cargo build --release
 ```
 3. Install manually:
-```
+```sh
 sudo cp target/release/archlink /usr/local/bin
 ```
 
-### Via AUR (Submitted)
-1. Use an AUR helped to install
-```
-sudo pacman -S archlink
-```
-or 
-```
+### From AUR
+```sh
 yay -S archlink
 ```
+or compile the source.
 
 ## Prerequisites
 - Arch Linux system (otherwise you're wasting your time here).
@@ -47,7 +51,7 @@ arch link search <query>
 ```
 Example:
 ```
-arch linksearch python
+archlink search python
 ```
 Output:
 ```
