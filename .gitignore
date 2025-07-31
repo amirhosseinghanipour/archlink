@@ -23,3 +23,5 @@ debug/
 
 /target
 *.pkg.tar.zst
+
+Cargo.lock
