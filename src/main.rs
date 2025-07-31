@@ -1,4 +1,5 @@
 use clap::{Arg, Command};
+use colored::Colorize;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -7,11 +8,8 @@ use std::path::Path;
 use std::process::Command as SysCommand;
 use std::time::Duration;
 use strsim::levenshtein;
-use tokio;
-use colored::Colorize;
-use serde_json;
 
-const VERSION: &str = "0.1.0";
+const VERSION: &str = "0.1.1";
 
 #[derive(Serialize, Deserialize, Debug)]
 struct AurPackage {
@@ -29,7 +27,7 @@ struct AurResponse {
     results: Vec<AurPackage>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct Package {
     name: String,
     version: String,
@@ -39,7 +37,7 @@ struct Package {
 
 #[derive(Serialize, Deserialize, Debug)]
 struct Config {
-    max_results: Option<usize>, 
+    max_results: Option<usize>,
 }
 
 impl Config {
@@ -52,20 +50,20 @@ impl Config {
                     Err(e) => {
                         eprintln!(
                             "{}",
-                            format!("Warning: Invalid config file format: {}", e).yellow()
+                            format!("Warning: Invalid config file format: {e}").yellow()
                         );
                     }
                 },
                 Err(e) => {
                     eprintln!(
                         "{}",
-                        format!("Warning: Failed to read config file: {}", e).yellow()
+                        format!("Warning: Failed to read config file: {e}").yellow()
                     );
                 }
             }
         }
         Config {
-            max_results: Some(10), 
+            max_results: Some(10),
         }
     }
 }
@@ -74,6 +72,8 @@ impl Config {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = Config::load();
     let max_results = config.max_results.unwrap_or(10);
+
+    let client = Client::builder().timeout(Duration::from_secs(10)).build()?;
 
     let matches = Command::new("archlink")
         .version(VERSION)
@@ -102,20 +102,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     match matches.subcommand() {
         Some(("search", sub_m)) => {
-            let query = sub_m.get_one::<String>("query").unwrap().trim();
+            let query = sub_m
+                .get_one::<String>("query")
+                .map(|s| s.as_str())
+                .unwrap_or_default()
+                .trim();
             if query.is_empty() {
                 eprintln!("{}", "Error: Query cannot be empty.".red());
                 std::process::exit(1);
             }
-            search_packages(query, max_results).await?;
+            search_packages(&client, query, max_results).await?;
         }
         Some(("install", sub_m)) => {
-            let package = sub_m.get_one::<String>("package").unwrap().trim();
+            let package = sub_m
+                .get_one::<String>("package")
+                .map(|s| s.as_str())
+                .unwrap_or_default()
+                .trim();
             if package.is_empty() {
                 eprintln!("{}", "Error: Package name cannot be empty.".red());
                 std::process::exit(1);
             }
-            install_package(package, "unknown")?;
+            if let Err(e) = install_package(package, "unknown") {
+                eprintln!("{e}");
+                std::process::exit(1);
+            }
         }
         _ => unreachable!(),
     }
@@ -123,25 +134,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-async fn search_packages(query: &str, max_results: usize) -> Result<(), Box<dyn std::error::Error>> {
-    let mut official_results = Vec::new();
+async fn search_packages(
+    client: &Client,
+    query: &str,
+    max_results: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
+    println!("{}", "Searching official repos and AUR...".bold().white());
 
-    match search_arch_website(query).await {
-        Ok(results) => official_results.extend(results),
-        Err(e) => eprintln!("{}", format!("Warning: Web search failed: {}", e).yellow()),
-    }
+    let (official_res, aur_res) = tokio::join!(
+        search_arch_website(client, query),
+        search_aur(client, query)
+    );
 
-    if official_results.is_empty() {
-        match search_official_repos(query) {
-            Ok(results) => official_results.extend(results),
-            Err(e) => eprintln!("{}", format!("Warning: pacman search failed: {}", e).yellow()),
-        }
-    }
-
-    let aur_results = match search_aur(query).await {
-        Ok(results) => results,
+    let official_results = match official_res {
+        Ok(packages) => packages,
         Err(e) => {
-            eprintln!("{}", format!("Warning: AUR search failed: {}", e).yellow());
+            eprintln!(
+                "{}",
+                format!("Warning: Official repo search failed: {e}").yellow()
+            );
+            Vec::new()
+        }
+    };
+
+    let aur_results = match aur_res {
+        Ok(packages) => packages,
+        Err(e) => {
+            eprintln!("{}", format!("Warning: AUR search failed: {e}").yellow());
             Vec::new()
         }
     };
@@ -151,15 +170,15 @@ async fn search_packages(query: &str, max_results: usize) -> Result<(), Box<dyn 
     if all_results.is_empty() {
         println!(
             "{}",
-            format!("No packages found for '{}'. Try refining your query.", query).yellow()
+            format!(
+                "No packages found for '{query}'. Try refining your query."
+            )
+            .yellow()
         );
         return Ok(());
     }
 
-    println!(
-        "{}",
-        format!("Suggestions for '{}':", query).bold().white()
-    );
+    println!("{}", format!("Suggestions for '{query}':").bold().white());
     for (i, pkg) in all_results.iter().enumerate() {
         println!(
             "{}. {:<30} {:<15} - {} [{}]",
@@ -173,14 +192,13 @@ async fn search_packages(query: &str, max_results: usize) -> Result<(), Box<dyn 
 
     print!(
         "{}",
-        "Enter the number of the package to install (0 to exit): ".bold().white()
+        "Enter the number of the package to install (0 to exit): "
+            .bold()
+            .white()
     );
     io::stdout().flush()?;
     let mut input = String::new();
-    io::stdin()
-        .lock()
-        .read_line(&mut input)
-        .map_err(|e| format!("Failed to read input: {}", e))?;
+    io::stdin().lock().read_line(&mut input)?;
     let choice = input.trim().parse::<usize>().unwrap_or(0);
 
     if choice > 0 && choice <= all_results.len() {
@@ -193,12 +211,12 @@ async fn search_packages(query: &str, max_results: usize) -> Result<(), Box<dyn 
         );
         io::stdout().flush()?;
         let mut confirm = String::new();
-        io::stdin()
-            .lock()
-            .read_line(&mut confirm)
-            .map_err(|e| format!("Failed to read confirmation: {}", e))?;
+        io::stdin().lock().read_line(&mut confirm)?;
         if confirm.trim().to_lowercase().starts_with('y') {
-            install_package(&selected_package.name, selected_package.source)?;
+            if let Err(e) = install_package(&selected_package.name, selected_package.source) {
+                eprintln!("{e}");
+                std::process::exit(1);
+            }
         } else {
             println!("{}", "Installation cancelled.".yellow());
         }
@@ -209,39 +227,30 @@ async fn search_packages(query: &str, max_results: usize) -> Result<(), Box<dyn 
     Ok(())
 }
 
-async fn search_arch_website(query: &str) -> Result<Vec<Package>, String> {
-    let client = Client::builder()
-        .timeout(Duration::from_secs(10))
-        .build()
-        .map_err(|e| format!("Failed to build HTTP client: {}", e))?;
+async fn search_arch_website(client: &Client, query: &str) -> Result<Vec<Package>, reqwest::Error> {
     let url = format!(
         "https://archlinux.org/packages/search/json/?q={}",
         urlencoding::encode(query)
     );
-    let response = client
-        .get(&url)
-        .send()
-        .await
-        .map_err(|e| format!("Failed to fetch Arch website data: {}", e))?;
-    let json: serde_json::Value = response
-        .json()
-        .await
-        .map_err(|e| format!("Failed to parse JSON: {}", e))?;
+    let response = client.get(&url).send().await?;
+    let json: serde_json::Value = response.json().await?;
 
     let mut packages = Vec::new();
     if let Some(results) = json.get("results").and_then(|r| r.as_array()) {
         for pkg in results {
-            let name = pkg["pkgname"]
-                .as_str()
+            let name = pkg
+                .get("pkgname")
+                .and_then(|n| n.as_str())
                 .unwrap_or("unknown")
                 .to_string();
             let version = format!(
                 "{}-{}",
-                pkg["pkgver"].as_str().unwrap_or(""),
-                pkg["pkgrel"].as_str().unwrap_or("")
+                pkg.get("pkgver").and_then(|v| v.as_str()).unwrap_or(""),
+                pkg.get("pkgrel").and_then(|r| r.as_str()).unwrap_or("")
             );
-            let description = pkg["pkgdesc"]
-                .as_str()
+            let description = pkg
+                .get("pkgdesc")
+                .and_then(|d| d.as_str())
                 .unwrap_or("No description available")
                 .to_string();
             packages.push(Package {
@@ -255,75 +264,13 @@ async fn search_arch_website(query: &str) -> Result<Vec<Package>, String> {
     Ok(packages)
 }
 
-fn search_official_repos(query: &str) -> Result<Vec<Package>, String> {
-    let output = SysCommand::new("pacman")
-        .args(["-Ss", query])
-        .output()
-        .map_err(|e| format!("Failed to run pacman: {}", e))?;
-    let output_str = String::from_utf8_lossy(&output.stdout);
-    if !output.status.success() {
-        return Err(format!("pacman failed with: {}", output_str));
-    }
-
-    let mut packages = Vec::new();
-    let mut current_pkg: Option<Package> = None;
-
-    for line in output_str.lines() {
-        if line.starts_with(" ") {
-            if let Some(ref mut pkg) = current_pkg {
-                pkg.description.push_str(line.trim());
-                pkg.description.push(' ');
-            }
-        } else if !line.is_empty() {
-            if let Some(pkg) = current_pkg.take() {
-                packages.push(pkg);
-            }
-            let parts: Vec<&str> = line.splitn(2, ' ').collect();
-            if parts.len() < 2 {
-                continue;
-            }
-            let name_ver: Vec<&str> = parts[0].split('/').collect();
-            let name = name_ver.last().unwrap_or(&"unknown").to_string();
-            let version_desc: Vec<&str> = parts[1].splitn(2, ' ').collect();
-            let version = version_desc[0].to_string();
-            let description = version_desc
-                .get(1)
-                .unwrap_or(&"No description available")
-                .to_string();
-            current_pkg = Some(Package {
-                name,
-                version,
-                description,
-                source: "official",
-            });
-        }
-    }
-    if let Some(pkg) = current_pkg {
-        packages.push(pkg);
-    }
-    Ok(packages)
-}
-
-async fn search_aur(query: &str) -> Result<Vec<Package>, Box<dyn std::error::Error>> {
-    let client = Client::builder()
-        .timeout(Duration::from_secs(10))
-        .build()?;
+async fn search_aur(client: &Client, query: &str) -> Result<Vec<Package>, reqwest::Error> {
     let url = format!(
         "https://aur.archlinux.org/rpc/?v=5&type=search&arg={}",
         urlencoding::encode(query)
     );
-    let response = client.get(&url).send().await.map_err(|e| {
-        format!(
-            "Failed to fetch AUR data: {}. Check your network connection.",
-            e
-        )
-    })?;
-    let aur_data = response.json::<AurResponse>().await.map_err(|e| {
-        format!(
-            "Failed to parse AUR response: {}. AUR API may have changed.",
-            e
-        )
-    })?;
+    let response = client.get(&url).send().await?;
+    let aur_data: AurResponse = response.json().await?;
 
     Ok(aur_data
         .results
@@ -333,7 +280,7 @@ async fn search_aur(query: &str) -> Result<Vec<Package>, Box<dyn std::error::Err
             version: pkg.version,
             description: pkg
                 .description
-                .unwrap_or("No description available".to_string()),
+                .unwrap_or_else(|| "No description available".to_string()),
             source: "aur",
         })
         .collect())
@@ -345,7 +292,7 @@ fn rank_results(
     query: &str,
     max_results: usize,
 ) -> Vec<Package> {
-    let mut combined = Vec::new();
+    let mut combined: Vec<Package> = Vec::new();
     combined.extend(official);
     combined.extend(aur);
 
@@ -380,43 +327,50 @@ fn install_package(package: &str, source: &str) -> Result<(), String> {
         attempted.push("pacman");
         println!(
             "{}",
-            format!("Trying 'sudo pacman -S {}'... (may prompt for password)", package)
-                .bold()
-                .white()
+            format!(
+                "Trying 'sudo pacman -S {package}'... (may prompt for password)"
+            )
+            .bold()
+            .white()
         );
         let status = SysCommand::new("sudo")
             .args(["pacman", "-S", package, "--noconfirm"])
             .status()
-            .map_err(|e| format!("Failed to run pacman: {}", e))?;
+            .map_err(|e| format!("Failed to run pacman: {e}"))?;
         if status.success() {
             println!(
                 "{}",
-                format!("Successfully installed '{}' with pacman", package).green()
+                format!("Successfully installed '{package}' with pacman").green()
             );
             return Ok(());
         }
     }
 
-    let helpers = [("yay", vec!["-S"]), ("paru", vec!["-S"])];
-    for (helper, args) in helpers {
-        if SysCommand::new("which").arg(helper).output().is_ok() {
+    let helpers = [("yay", &["-S"] as &[&str]), ("paru", &["-S"])];
+    for (helper, args) in &helpers {
+        if is_command_in_path(helper) {
             attempted.push(helper);
             println!(
                 "{}",
-                format!("Trying '{} -S {}'... (may prompt for password)", helper, package)
-                    .bold()
-                    .white()
+                format!(
+                    "Trying '{} {} {}'... (may prompt for password)",
+                    helper,
+                    args.join(" "),
+                    package
+                )
+                .bold()
+                .white()
             );
-            let mut cmd_args = args;
+            let mut cmd_args = args.to_vec();
             cmd_args.push(package);
             let status = SysCommand::new(helper)
                 .args(&cmd_args)
                 .status()
-                .map_err(|e| format!("Failed to run {}: {}", helper, e))?;
+                .map_err(|e| format!("Failed to run {helper}: {e}"))?;
             if status.success() {
                 println!(
                     "{}",
-                    format!("Successfully installed '{}' with {}", package, helper).green()
+                    format!("Successfully installed '{package}' with {helper}").green()
                 );
                 return Ok(());
             }
@@ -432,4 +386,11 @@ fn install_package(package: &str, source: &str) -> Result<(), String> {
         )
         .red()
     ))
+}
+
+fn is_command_in_path(command: &str) -> bool {
+    SysCommand::new("which")
+        .arg(command)
+        .output()
+        .is_ok_and(|output| output.status.success())
 }
